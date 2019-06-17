@@ -1,0 +1,1453 @@
+import com.github.javaparser.JavaParser
+import com.github.javaparser.ParserConfiguration.LanguageLevel
+import com.github.javaparser.ast.CompilationUnit
+import com.github.javaparser.ast.Modifier
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration
+import com.github.javaparser.printer.PrettyPrinter
+import com.github.javaparser.printer.PrettyPrinterConfiguration
+import com.github.javaparser.symbolsolver.JavaSymbolSolver
+import com.github.javaparser.symbolsolver.model.resolution.TypeSolver
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver
+import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver
+
+import javax.annotation.Generated
+import javax.naming.ConfigurationException
+import java.util.function.Function
+import java.util.function.Supplier
+import java.util.stream.Collectors
+import java.util.stream.Stream
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.github.javaparser:javaparser-symbol-solver-core:3.6.8'
+        classpath 'javax.annotation:javax.annotation-api:1.3.2'
+    }
+}
+
+def javacordApi = project(':javacord-api')
+def javacordCore = project(':javacord-core')
+
+task generateListenerManagers {
+    ext.apiOutputDirectory = "$javacordApi.buildDir/generated/listener-manager-interfaces"
+    ext.coreOutputDirectory = "$javacordCore.buildDir/generated/listener-manager-interfaces"
+
+    inputs.files javacordApi.sourceSets.main.allJava withPropertyName 'apiJavaFiles' withPathSensitivity PathSensitivity.RELATIVE
+    inputs.files javacordCore.sourceSets.main.allJava withPropertyName 'coreJavaFiles' withPathSensitivity PathSensitivity.RELATIVE
+    outputs.dir apiOutputDirectory withPropertyName 'apiOutputDirectory'
+    outputs.dir coreOutputDirectory withPropertyName 'coreOutputDirectory'
+    outputs.cacheIf { true }
+
+    doLast {
+        delete apiOutputDirectory
+        delete coreOutputDirectory
+
+        def typeSolver = new CombinedTypeSolver(
+                (javacordApi.sourceSets.main.allJava.srcDirs + javacordCore.sourceSets.main.allJava.srcDirs)
+                        .findAll { it.directory }
+                        .collect { new JavaParserTypeSolver(it) }
+                        as TypeSolver[])
+        typeSolver.add new ReflectionTypeSolver()
+        def staticJavaparserConfiguration = JavaParser.staticConfiguration
+        staticJavaparserConfiguration.symbolResolver = new JavaSymbolSolver(typeSolver)
+        staticJavaparserConfiguration.languageLevel = LanguageLevel.JAVA_9
+
+        // collect the attachable listener interfaces
+        def attachableInterfacesMap = javacordApi.sourceSets.main.allJava.matching {
+            include 'org/javacord/api/listener/**/*AttachableListener.java'
+            exclude 'org/javacord/api/listener/**/ObjectAttachableListener.java'
+        }.collectMany {
+            JavaParser.parse(it).findAll(ClassOrInterfaceDeclaration)*.resolve()
+        }.collectEntries {
+            [it, []]
+        }
+
+        // determine which attachable interfaces have subtypes as they need special treatment
+        def attachableInterfacesWhichHaveSubtypes = attachableInterfacesMap.keySet()
+                .findAll { attachableInterface ->
+            attachableInterfacesMap.keySet().any {
+                it.allInterfacesExtended.typeDeclaration.contains attachableInterface
+            }
+        }
+        def attachableInterfacesWithDirectSubtypes = attachableInterfacesMap.keySet()
+                .collectEntries { attachableInterface ->
+            [attachableInterface, attachableInterfacesMap.keySet().findAll {
+                it.interfacesExtended.typeDeclaration.contains attachableInterface
+            }]
+        }
+
+        // determine which listeners extend which attachable listener directly
+        javacordApi.sourceSets.main.allJava.matching {
+            include 'org/javacord/api/listener/**/*Listener.java'
+            exclude 'org/javacord/api/listener/**/*AttachableListener.java'
+        }.collectMany {
+            JavaParser.parse(it).findAll(ClassOrInterfaceDeclaration)*.resolve()
+        }.each { listener ->
+            def extendedInterfaces = listener.interfacesExtended.typeDeclaration
+            attachableInterfacesMap.each {
+                if (extendedInterfaces.contains(it.key)) { it.value << listener }
+            }
+        }
+
+        // determine which object class extends which attachable listener manager
+        def objectClassByAttachableListenerManagerEntries = javacordApi.sourceSets.main.allJava.matching {
+            exclude '**/*AttachableListenerManager.java'
+        }.collectMany {
+            JavaParser.parse(it).findAll(ClassOrInterfaceDeclaration)
+        }.findAll {
+            it.extendedTypes.any { it.nameAsString.endsWith 'AttachableListenerManager' }
+        }.collect {
+            [it.extendedTypes.find { it.nameAsString.endsWith 'AttachableListenerManager' }.nameAsString, it.resolve()]
+        }
+        def multipleObjectClassesAvailable = objectClassByAttachableListenerManagerEntries
+                .groupBy { it.first() }
+                .findAll { it.value.size() > 1 }
+        if (multipleObjectClassesAvailable) {
+            throw new ConfigurationException("Multiple attachable listener manager inheritance discovered\n\t- " +
+                    multipleObjectClassesAvailable.sort().collect {
+                        "$it.key is implemented / extended by the following ${it.value.size()} types " +
+                                "while only one is expected:\n\t\t- ${it.value*.get(1).name.sort().join('\n\t\t- ')}"
+                    }.join('\n\t- '))
+        }
+        def objectClassByAttachableListenerManager = objectClassByAttachableListenerManagerEntries.collectEntries { it }
+
+        def discordApiName =
+                typeSolver.solveType('org.javacord.api.DiscordApi').qualifiedName
+        def discordApiBuilderName =
+                typeSolver.solveType('org.javacord.api.DiscordApiBuilder').qualifiedName
+        def discordApiImplName =
+                typeSolver.solveType('org.javacord.core.DiscordApiImpl').qualifiedName
+        def listenerManagerName =
+                typeSolver.solveType('org.javacord.api.util.event.ListenerManager').qualifiedName
+        def objectAttachableListener =
+                typeSolver.solveType('org.javacord.api.listener.ObjectAttachableListener')
+        def globallyAttachableListener =
+                typeSolver.solveType('org.javacord.api.listener.GloballyAttachableListener')
+        def messageAttachableListener =
+                typeSolver.solveType('org.javacord.api.listener.message.MessageAttachableListener')
+
+        // generate attachable listener manager interfaces
+        attachableInterfacesMap.each { attachableInterface, listeners ->
+            def attachableListenerManagerFile = new CompilationUnit(attachableInterface.packageName)
+                    .setStorage(file("$apiOutputDirectory/" +
+                            "${attachableInterface.packageName.replace '.', '/'}/" +
+                            "${attachableInterface.name}Manager.java").toPath())
+                    .addImport(Collection)
+                    .addImport(List)
+                    .addImport(Map)
+                    .addImport(listenerManagerName)
+            def attachableListenerManagerInterface = attachableListenerManagerFile
+                    .addInterface("${attachableInterface.name}Manager")
+                    .addSingleMemberAnnotation(Generated, '"listener-manager-generation.gradle"')
+                    .setJavadocComment(
+                            "This class can be used to add and retrieve {@link ${attachableInterface.name}}s.")
+
+            def corePackageName = attachableInterface.packageName.replaceFirst(/\.api(?=.|$)/, '.core')
+            def internalAttachableListenerManagerFile
+            def internalAttachableListenerManagerInterface
+            def chainableGloballyAttachableListenerManagerFile
+            def chainableGloballyAttachableListenerManagerInterface
+            if (attachableInterface.equals(globallyAttachableListener)) {
+                chainableGloballyAttachableListenerManagerFile = new CompilationUnit(attachableInterface.packageName)
+                        .setStorage(file("$apiOutputDirectory/" +
+                        "${attachableInterface.packageName.replace '.', '/'}/" +
+                        'ChainableGloballyAttachableListenerManager.java').toPath())
+                        .addImport(Function)
+                        .addImport(Supplier)
+                        .addImport(discordApiName)
+                        .addImport(discordApiBuilderName)
+                chainableGloballyAttachableListenerManagerInterface = chainableGloballyAttachableListenerManagerFile
+                        .addInterface('ChainableGloballyAttachableListenerManager')
+                        .addSingleMemberAnnotation(Generated, '"listener-manager-generation.gradle"')
+                        .setJavadocComment(
+                        'This class can be used to add and retrieve {@link GloballyAttachableListener}s ' +
+                                'on the {@link DiscordApiBuilder}.')
+            } else {
+                internalAttachableListenerManagerFile =
+                        new CompilationUnit(corePackageName)
+                                .setStorage(file("$coreOutputDirectory/" +
+                                "${corePackageName.replace '.', '/'}/" +
+                                "Internal${attachableInterface.name}Manager.java").toPath())
+                                .addImport(List)
+                                .addImport(discordApiName)
+                                .addImport(discordApiImplName)
+                                .addImport(listenerManagerName)
+                                .addImport("${attachableInterface.packageName}.${attachableInterface.name}Manager")
+
+                internalAttachableListenerManagerInterface = internalAttachableListenerManagerFile
+                        .addInterface("Internal${attachableInterface.name}Manager")
+                        .addSingleMemberAnnotation(Generated, '"listener-manager-generation.gradle"')
+                        .setJavadocComment(
+                        "The implementation of {@code ${attachableInterface.name}Manager}.")
+                        .addExtendedType("${attachableInterface.name}Manager")
+
+                internalAttachableListenerManagerInterface
+                        .addMethod('getApi')
+                        .setJavadocComment('''
+                        Gets the discord api instance.
+
+                        @return The discord api instance.
+                    '''.stripIndent())
+                        .setType('DiscordApi')
+                        .removeBody()
+
+                internalAttachableListenerManagerInterface
+                        .addMethod('getId')
+                        .setJavadocComment('''
+                        Gets the id of this object.
+
+                        @return The id of this object.
+                    '''.stripIndent())
+                        .setType(long)
+                        .removeBody()
+            }
+
+            def uncachedMessageAttachableListenerManagerFile
+            def uncachedMessageAttachableListenerManagerInterface
+            def internalUncachedMessageAttachableListenerManagerFile
+            def internalUncachedMessageAttachableListenerManagerInterface
+            if (attachableInterface.equals(messageAttachableListener)) {
+                uncachedMessageAttachableListenerManagerFile = new CompilationUnit(attachableInterface.packageName)
+                        .setStorage(file("$apiOutputDirectory/" +
+                                "${attachableInterface.packageName.replace '.', '/'}/" +
+                                'UncachedMessageAttachableListenerManager.java').toPath())
+                        .addImport(Collection)
+                        .addImport(List)
+                        .addImport(Map)
+                        .addImport(listenerManagerName)
+
+                uncachedMessageAttachableListenerManagerInterface = uncachedMessageAttachableListenerManagerFile
+                        .addInterface('UncachedMessageAttachableListenerManager')
+                        .addSingleMemberAnnotation(Generated, '"listener-manager-generation.gradle"')
+                        .setJavadocComment('This class can be used to add and retrieve ' +
+                                '{@link MessageAttachableListener}s for potentially uncached messages.')
+
+                internalUncachedMessageAttachableListenerManagerFile =
+                        new CompilationUnit(corePackageName)
+                                .setStorage(file("$coreOutputDirectory/" +
+                                        "${corePackageName.replace '.', '/'}/" +
+                                        'InternalUncachedMessageAttachableListenerManager.java').toPath())
+                                .addImport(Collections)
+                                .addImport(List)
+                                .addImport(discordApiName)
+                                .addImport(discordApiImplName)
+                                .addImport(listenerManagerName)
+                                .addImport(
+                                        "${attachableInterface.packageName}.UncachedMessageAttachableListenerManager")
+
+                internalUncachedMessageAttachableListenerManagerInterface =
+                        internalUncachedMessageAttachableListenerManagerFile
+                                .addInterface('InternalUncachedMessageAttachableListenerManager')
+                                .addSingleMemberAnnotation(Generated, '"listener-manager-generation.gradle"')
+                                .setJavadocComment(
+                                        'The implementation of {@code UncachedMessageAttachableListenerManager}.')
+                                .addExtendedType('UncachedMessageAttachableListenerManager')
+
+                internalUncachedMessageAttachableListenerManagerInterface
+                        .addMethod('getApi')
+                        .setJavadocComment('''
+                            Gets the discord api instance.
+
+                            @return The discord api instance.
+                        '''.stripIndent())
+                        .setType('DiscordApi')
+                        .removeBody()
+            }
+
+            listeners.each {
+                addConcreteListenerMethods typeSolver, attachableInterface, it, objectClassByAttachableListenerManager,
+                        attachableListenerManagerFile, attachableListenerManagerInterface,
+                        chainableGloballyAttachableListenerManagerFile,
+                        chainableGloballyAttachableListenerManagerInterface,
+                        uncachedMessageAttachableListenerManagerFile, uncachedMessageAttachableListenerManagerInterface,
+                        internalUncachedMessageAttachableListenerManagerFile,
+                        internalUncachedMessageAttachableListenerManagerInterface,
+                        internalAttachableListenerManagerFile, internalAttachableListenerManagerInterface
+            }
+
+            if (attachableInterface.equals(globallyAttachableListener)) {
+                addGenericGloballyAttachableListenerMethods attachableListenerManagerInterface,
+                        chainableGloballyAttachableListenerManagerInterface
+            } else {
+                if (uncachedMessageAttachableListenerManagerInterface) {
+                    uncachedMessageAttachableListenerManagerFile.addImport objectAttachableListener.qualifiedName
+                }
+                attachableListenerManagerFile.addImport objectAttachableListener.qualifiedName
+                attachableInterfacesWithDirectSubtypes[attachableInterface].each {
+                    if (it.packageName != attachableInterface.packageName) {
+                        attachableListenerManagerFile.addImport "${it.qualifiedName}Manager"
+                    }
+                    attachableListenerManagerInterface.addExtendedType "${it.name}Manager"
+
+                    def packageName = it.packageName.replaceFirst(/\.api(?=.|$)/, '.core')
+                    if (packageName != corePackageName) {
+                        internalAttachableListenerManagerFile.addImport "${packageName}.Internal${it.name}Manager"
+                    }
+                    internalAttachableListenerManagerInterface.addExtendedType "Internal${it.name}Manager"
+                }
+                def listenerManagerTypeParameter =
+                        attachableInterfacesWhichHaveSubtypes.contains(attachableInterface) ?
+                                "? extends $attachableInterface.name" : 'T'
+                addGenericObjectAttachableListenerMethods typeSolver, attachableInterface,
+                        attachableListenerManagerFile, attachableListenerManagerInterface,
+                        listenerManagerTypeParameter, uncachedMessageAttachableListenerManagerInterface,
+                        internalUncachedMessageAttachableListenerManagerFile,
+                        internalUncachedMessageAttachableListenerManagerInterface,
+                        objectClassByAttachableListenerManager, internalAttachableListenerManagerFile,
+                        internalAttachableListenerManagerInterface, attachableInterfacesWithDirectSubtypes
+            }
+
+            [
+                    attachableListenerManagerFile,
+                    chainableGloballyAttachableListenerManagerFile,
+                    internalAttachableListenerManagerFile,
+                    uncachedMessageAttachableListenerManagerFile,
+                    internalUncachedMessageAttachableListenerManagerFile
+            ].findAll().storage*.ifPresent {
+                it.save {
+                    new PrettyPrinter(new PrettyPrinterConfiguration()
+                            .setOrderImports(true)
+                            .setEndOfLineCharacter('\n')
+                            .setColumnAlignParameters(true)
+                            .setColumnAlignFirstMethodChain(true)
+                    ).print it
+                }
+            }
+        }
+    }
+}
+rootProject.generate.dependsOn generateListenerManagers
+
+configure([javacordApi, javacordCore]) {
+    sourceSets {
+        main {
+            java {
+                srcDir generateListenerManagers."${shortName}OutputDirectory"
+            }
+        }
+    }
+    compileJava.dependsOn generateListenerManagers
+
+    apply plugin: 'idea'
+    idea {
+        module {
+            generatedSourceDirs << file(generateListenerManagers."${shortName}OutputDirectory")
+        }
+    }
+    // we only want to set the generated flag, not the tasks
+    configure([tasks.idea, ideaModule]) {
+        enabled false
+        tasks.remove it
+    }
+}
+
+def addConcreteListenerMethods(typeSolver, attachableInterface, listener, objectClassByAttachableListenerManager,
+                               attachableListenerManagerFile, attachableListenerManagerInterface,
+                               chainableGloballyAttachableListenerManagerFile,
+                               chainableGloballyAttachableListenerManagerInterface,
+                               uncachedMessageAttachableListenerManagerFile,
+                               uncachedMessageAttachableListenerManagerInterface,
+                               internalUncachedMessageAttachableListenerManagerFile,
+                               internalUncachedMessageAttachableListenerManagerInterface,
+                               internalAttachableListenerManagerFile, internalAttachableListenerManagerInterface) {
+    def specialMessageAttachable = uncachedMessageAttachableListenerManagerInterface &&
+            !listener.name.startsWith('CachedMessage')
+
+    if (listener.packageName != attachableInterface.packageName) {
+        attachableListenerManagerFile.addImport listener.qualifiedName
+        chainableGloballyAttachableListenerManagerFile?.addImport listener.qualifiedName
+        if (specialMessageAttachable) {
+            uncachedMessageAttachableListenerManagerFile.addImport listener.qualifiedName
+        }
+    }
+    if (specialMessageAttachable) {
+        internalUncachedMessageAttachableListenerManagerFile.addImport listener.qualifiedName
+    }
+    internalAttachableListenerManagerFile?.addImport listener.qualifiedName
+
+    if (specialMessageAttachable) {
+        addMessageSpecificConcreteListenerMethods typeSolver, attachableInterface, listener,
+                attachableListenerManagerFile, attachableListenerManagerInterface
+
+        uncachedMessageAttachableListenerManagerInterface
+                .addMethod("add$listener.name")
+                .setJavadocComment("""
+                    Adds a {@code $listener.name}.
+
+                    @param listener The listener to add.
+                    @param messageId The id of the message which should be listened to.
+                    @return The manager of the listener.
+                """.stripIndent())
+                .setType("ListenerManager<$listener.name>")
+                .addParameter(long, 'messageId')
+                .addParameter(listener.name, 'listener')
+                .removeBody()
+    }
+
+    def globallyAttachable =
+            attachableInterface == typeSolver.solveType('org.javacord.api.listener.GloballyAttachableListener')
+
+    def addListenerMethod = attachableListenerManagerInterface
+            .addMethod("add$listener.name", *(globallyAttachable ? [Modifier.DEFAULT] : []))
+            .setJavadocComment("""
+                Adds a {@code $listener.name}.
+
+                @param listener The listener to add.
+                @return The manager of the listener.
+            """.stripIndent())
+            .setType("ListenerManager<$listener.name>")
+            .addParameter(listener.name, 'listener')
+
+    if (globallyAttachable) {
+        addListenerMethod
+                .createBody()
+                .addStatement("return addListener(${listener.name}.class, listener);")
+
+        chainableGloballyAttachableListenerManagerInterface
+                .addMethod("add$listener.name", Modifier.DEFAULT)
+                .setJavadocComment("""
+                    Adds a {@code $listener.name} to all created {@code DiscordApi} instances.
+
+                    @param listener The listener to add.
+                    @return The current instance in order to chain call methods.
+                """.stripIndent())
+                .setType("DiscordApiBuilder")
+                .addParameter(listener.name, 'listener')
+                .createBody()
+                .addStatement("return addListener(${listener.name}.class, listener);")
+
+        chainableGloballyAttachableListenerManagerInterface
+                .addMethod("add$listener.name", Modifier.DEFAULT)
+                .setJavadocComment("""
+                    Adds a {@code $listener.name} to all created {@code DiscordApi} instances. The supplier is called
+                    for every created {@code DiscordApi} instance, so either the same or different instances can be
+                    registered. One example would be a method reference to a default constructor like
+                    {@code MyListener::new}.
+
+                    @param listenerSupplier The supplier of listeners to add.
+                    @return The current instance in order to chain call methods.
+                """.stripIndent())
+                .setType("DiscordApiBuilder")
+                .addParameter("Supplier<$listener.name>", 'listenerSupplier')
+                .createBody()
+                .addStatement("return addListener(${listener.name}.class, listenerSupplier);")
+
+        chainableGloballyAttachableListenerManagerInterface
+                .addMethod("add$listener.name", Modifier.DEFAULT)
+                .setJavadocComment("""
+                    Adds a {@code $listener.name} to all created {@code DiscordApi} instances. The function is called
+                    for every created {@code DiscordApi} instance, so either the same or different instances can be
+                    registered. One example would be a method reference to a constructor with a {@code DiscordApi}
+                    parameter like {@code MyListener::new}.
+
+                    @param listenerFunction The function to provide listeners to add.
+                    @return The current instance in order to chain call methods.
+                """.stripIndent())
+                .setType("DiscordApiBuilder")
+                .addParameter("Function<DiscordApi, $listener.name>", 'listenerFunction')
+                .createBody()
+                .addStatement("return addListener(${listener.name}.class, listenerFunction);")
+    } else {
+        addListenerMethod.removeBody()
+    }
+
+    def objectClass = objectClassByAttachableListenerManager."${attachableInterface.name}Manager"
+    if (!objectClass) {
+        throw new ConfigurationException("Found no type extending / implementing ${attachableInterface.name}Manager")
+    }
+
+    def methodImplementation = specialMessageAttachable ?
+            "return MessageAttachableListenerManager.add$listener.name(getApi(), getId(), listener);" :
+            "return ((DiscordApiImpl) getApi()).addObjectListener(" +
+                    "${objectClass.name}.class, getId(), ${listener.name}.class, listener);"
+
+    internalAttachableListenerManagerFile?.addImport(objectClass.qualifiedName)
+
+    if (specialMessageAttachable) {
+        internalUncachedMessageAttachableListenerManagerFile.addImport(objectClass.qualifiedName)
+
+        internalUncachedMessageAttachableListenerManagerInterface
+                .addMethod("add$listener.name", Modifier.DEFAULT)
+                .addMarkerAnnotation(Override)
+                .setType("ListenerManager<$listener.name>")
+                .addParameter(long, 'messageId')
+                .addParameter(listener.name, 'listener')
+                .createBody()
+                .addStatement(
+                        'return ((DiscordApiImpl) getApi()).addObjectListener(' +
+                                "Message.class, messageId, ${listener.name}.class, listener);")
+    }
+
+    internalAttachableListenerManagerInterface
+            ?.addMethod("add$listener.name", Modifier.DEFAULT)
+            ?.addMarkerAnnotation(Override)
+            ?.setType("ListenerManager<$listener.name>")
+            ?.addParameter(listener.name, 'listener')
+            ?.createBody()
+            ?.addStatement(methodImplementation)
+
+    if (specialMessageAttachable) {
+        [long, String].each { messageIdType ->
+            uncachedMessageAttachableListenerManagerInterface
+                    .addMethod("get${listener.name}s")
+                    .setJavadocComment("""
+                        Gets a list with all registered {@code $listener.name}s.
+
+                        @param messageId The id of the message.
+                        @return A list with all registered {@code $listener.name}s.
+                    """.stripIndent())
+                    .setType("List<$listener.name>")
+                    .addParameter(messageIdType, 'messageId')
+                    .removeBody()
+        }
+    }
+
+    def getListenersMethod = attachableListenerManagerInterface
+            .addMethod("get${listener.name}s", *(globallyAttachable ? [Modifier.DEFAULT] : []))
+            .setJavadocComment("""
+                Gets a list with all registered {@code $listener.name}s.
+
+                @return A list with all registered {@code $listener.name}s.
+            """.stripIndent())
+            .setType("List<$listener.name>")
+
+    if (globallyAttachable) {
+        getListenersMethod
+                .createBody()
+                .addStatement("return getListeners(${listener.name}.class);")
+    } else {
+        getListenersMethod.removeBody()
+    }
+
+    methodImplementation = specialMessageAttachable ?
+            "return MessageAttachableListenerManager.get${listener.name}s(getApi(), getId());" :
+            "return ((DiscordApiImpl) getApi()).getObjectListeners(" +
+                    "${objectClass.name}.class, getId(), ${listener.name}.class);"
+
+    if (specialMessageAttachable) {
+        [long, String].each { messageIdType ->
+            def body = internalUncachedMessageAttachableListenerManagerInterface
+                    .addMethod("get${listener.name}s", Modifier.DEFAULT)
+                    .addMarkerAnnotation(Override)
+                    .setType("List<$listener.name>")
+                    .addParameter(messageIdType, 'messageId')
+                    .createBody()
+
+            switch (messageIdType) {
+                case long:
+                    body.addStatement(
+                            'return ((DiscordApiImpl) getApi()).getObjectListeners(' +
+                                    "Message.class, messageId, ${listener.name}.class);")
+                    break
+
+                case String:
+                    body.addStatement """
+                        try {
+                            return get${listener.name}s(Long.valueOf(messageId));
+                        } catch (NumberFormatException ignored) {
+                            return Collections.emptyList();
+                        }
+                    """
+                    break
+            }
+        }
+    }
+
+    internalAttachableListenerManagerInterface
+            ?.addMethod("get${listener.name}s", Modifier.DEFAULT)
+            ?.addMarkerAnnotation(Override)
+            ?.setType("List<$listener.name>")
+            ?.createBody()
+            ?.addStatement(methodImplementation)
+}
+
+def addMessageSpecificConcreteListenerMethods(
+        typeSolver, attachableInterface, listener, attachableListenerManagerFile, attachableListenerManagerInterface) {
+    def discordApi = typeSolver.solveType('org.javacord.api.DiscordApi')
+    if (discordApi.packageName != attachableInterface.packageName) {
+        attachableListenerManagerFile.addImport discordApi.qualifiedName
+    }
+
+    attachableListenerManagerInterface
+            .addMethod("add$listener.name", Modifier.STATIC)
+            .setJavadocComment("""
+                Adds a {@code $listener.name}.
+
+                @param api The discord api instance.
+                @param messageId The id of the message which should be listened to.
+                @param listener The listener to add.
+                @return The manager of the listener.
+            """.stripIndent())
+            .setType("ListenerManager<$listener.name>")
+            .addParameter('DiscordApi', 'api')
+            .addParameter(long, 'messageId')
+            .addParameter(listener.name, 'listener')
+            .createBody()
+            .addStatement("return api.getUncachedMessageUtil().add$listener.name(messageId, listener);")
+
+    [long, String].each { messageIdType ->
+        attachableListenerManagerInterface
+                .addMethod("get${listener.name}s", Modifier.STATIC)
+                .setJavadocComment("""
+                    Gets a list with all registered {@code $listener.name}s of a specific message.
+
+                    @param api The discord api instance.
+                    @param messageId The id of the message.
+                    @return A list with all registered {@code $listener.name}s.
+                """.stripIndent())
+                .setType("List<$listener.name>")
+                .addParameter('DiscordApi', 'api')
+                .addParameter(messageIdType, 'messageId')
+                .createBody()
+                .addStatement("return api.getUncachedMessageUtil().get${listener.name}s(messageId);")
+    }
+}
+
+def addGenericGloballyAttachableListenerMethods(
+        attachableListenerManagerInterface, chainableGloballyAttachableListenerManagerInterface) {
+    attachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a {@code GloballyAttachableListener}.
+                Adding a listener multiple times will only add it once
+                and return the same listener manager on each invocation.
+                The order of invocation is according to first addition.
+
+                @param listenerClass The listener class.
+                @param listener The listener to add.
+                @param <T> The type of the listener.
+                @return The manager for the added listener.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('ListenerManager<T>')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    attachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a listener that implements one or more {@code GloballyAttachableListener}s.
+                Adding a listener multiple times will only add it once
+                and return the same listener managers on each invocation.
+                The order of invocation is according to first addition.
+
+                @param listener The listener to add.
+                @return The managers for the added listener.
+            '''.stripIndent())
+            .setType('Collection<ListenerManager<? extends GloballyAttachableListener>>')
+            .addParameter('GloballyAttachableListener', 'listener')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a {@code GloballyAttachableListener} to all created {@code DiscordApi} instances.
+                Adding a listener multiple times will only add it once.
+                The order of invocation is according to first addition.
+
+                @param listenerClass The listener class.
+                @param listener The listener to add.
+                @param <T> The type of the listener.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('DiscordApiBuilder')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a listener that implements one or more {@code GloballyAttachableListener}s to all created
+                {@code DiscordApi} instances.
+                Adding a listener multiple times will only add it once.
+                The order of invocation is according to first addition.
+
+                @param listener The listener to add.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .setType('DiscordApiBuilder')
+            .addParameter('GloballyAttachableListener', 'listener')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a {@code GloballyAttachableListener} to all created {@code DiscordApi} instances. The supplier is
+                called for every created {@code DiscordApi} instance, so either the same or different instances can be
+                registered. One example would be a method reference to a default constructor like
+                {@code MyListener::new}.
+                Adding a listener multiple times will only add it once.
+                The order of invocation is according to first addition.
+
+                @param listenerClass The listener class.
+                @param listenerSupplier The supplier of listeners to add.
+                @param <T> The type of the listener.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('DiscordApiBuilder')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('Supplier<T>', 'listenerSupplier')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a listener that implements one or more {@code GloballyAttachableListener}s to all created
+                {@code DiscordApi} instances. The supplier is called for every created {@code DiscordApi} instance,
+                so either the same or different instances can be registered. One example would be a method reference
+                to a default constructor like {@code MyListener::new}.
+                Adding a listener multiple times will only add it once.
+                The order of invocation is according to first addition.
+
+                @param listenerSupplier The supplier of listeners to add.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .setType('DiscordApiBuilder')
+            .addParameter('Supplier<GloballyAttachableListener>', 'listenerSupplier')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a {@code GloballyAttachableListener} to all created {@code DiscordApi} instances. The function
+                is called for every created {@code DiscordApi} instance, so either the same or different instances
+                can be registered. One example would be a method reference to a constructor with a {@code DiscordApi}
+                parameter like {@code MyListener::new}.
+                Adding a listener multiple times will only add it once.
+                The order of invocation is according to first addition.
+
+                @param listenerClass The listener class.
+                @param listenerFunction The function to provide listeners to add.
+                @param <T> The type of the listener.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('DiscordApiBuilder')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('Function<DiscordApi, T>', 'listenerFunction')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('addListener')
+            .setJavadocComment('''
+                Adds a listener that implements one or more {@code GloballyAttachableListener}s to all created
+                {@code DiscordApi} instances. The function is called for every created {@code DiscordApi} instance,
+                so either the same or different instances can be registered. One example would be a method reference
+                to a constructor with a {@code DiscordApi} parameter like {@code MyListener::new}.
+                Adding a listener multiple times will only add it once.
+                The order of invocation is according to first addition.
+
+                @param listenerFunction The function to provide listeners to add.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .setType('DiscordApiBuilder')
+            .addParameter('Function<DiscordApi, GloballyAttachableListener>', 'listenerFunction')
+            .removeBody()
+
+    attachableListenerManagerInterface
+            .addMethod('removeListener')
+            .setJavadocComment('''
+                Removes a listener that implements one or more {@code GloballyAttachableListener}s.
+
+                @param listener The listener to remove.
+            '''.stripIndent())
+            .addParameter('GloballyAttachableListener', 'listener')
+            .removeBody()
+
+    attachableListenerManagerInterface
+            .addMethod('removeListener')
+            .setJavadocComment('''
+                Removes a {@code GloballyAttachableListener}.
+
+                @param listenerClass The listener class.
+                @param listener The listener to remove.
+                @param <T> The type of the listener.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('removeListener')
+            .setJavadocComment('''
+                Removes a listener that implements one or more {@code GloballyAttachableListener}s from the list of
+                listeners to be added to {@code DiscordApi} instances. If the listener was already added to a
+                {@code DiscordApi} instance, it will not get removed by calling this method.
+                This method should normally only be used before calling one of the login methods.
+
+                @param listener The listener to remove.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .setType('DiscordApiBuilder')
+            .addParameter('GloballyAttachableListener', 'listener')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('removeListener')
+            .setJavadocComment('''
+                Removes a {@code GloballyAttachableListener} from the list of listeners to be added to
+                {@code DiscordApi} instances. If the listener was already added to a {@code DiscordApi} instance,
+                it will not get removed by calling this method.
+                This method should normally only be used before calling one of the login methods.
+
+                @param listenerClass The listener class.
+                @param listener The listener to remove.
+                @param <T> The type of the listener.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('DiscordApiBuilder')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('removeListenerSupplier')
+            .setJavadocComment('''
+                Removes a supplier of listeners that implements one or more {@code GloballyAttachableListener}s
+                from the list of listeners to be added to {@code DiscordApi} instances. If the listener was already
+                added to a {@code DiscordApi} instance, it will not get removed by calling this method.
+                This method should normally only be used before calling one of the login methods.
+
+                @param listenerSupplier The supplier of listeners to remove.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .setType('DiscordApiBuilder')
+            .addParameter('Supplier<GloballyAttachableListener>', 'listenerSupplier')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('removeListenerSupplier')
+            .setJavadocComment('''
+                Removes a supplier of {@code GloballyAttachableListener}s from the list of listeners to be added to
+                {@code DiscordApi} instances. If the listener was already added to a {@code DiscordApi} instance,
+                it will not get removed by calling this method.
+                This method should normally only be used before calling one of the login methods.
+
+                @param listenerClass The listener class.
+                @param listenerSupplier The supplier of listeners to remove.
+                @param <T> The type of the listener.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('DiscordApiBuilder')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('Supplier<T>', 'listenerSupplier')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('removeListenerFunction')
+            .setJavadocComment('''
+                Removes a function that provides listeners that implements one or more
+                {@code GloballyAttachableListener}s from the list of listeners to be added to {@code DiscordApi}
+                instances. If the listener was already added to a {@code DiscordApi} instance, it will not get
+                removed by calling this method.
+                This method should normally only be used before calling one of the login methods.
+
+                @param listenerFunction The function to provide listeners to remove.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .setType('DiscordApiBuilder')
+            .addParameter('Function<DiscordApi, GloballyAttachableListener>', 'listenerFunction')
+            .removeBody()
+
+    chainableGloballyAttachableListenerManagerInterface
+            .addMethod('removeListenerFunction')
+            .setJavadocComment('''
+                Removes a function that provides {@code GloballyAttachableListener}s from the list of listeners to be
+                added to {@code DiscordApi} instances. If the listener was already added to a {@code DiscordApi}
+                instance, it will not get removed by calling this method.
+                This method should normally only be used before calling one of the login methods.
+
+                @param listenerClass The listener class.
+                @param listenerFunction The function to provide listeners to remove.
+                @param <T> The type of the listener.
+                @return The current instance in order to chain call methods.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('DiscordApiBuilder')
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('Function<DiscordApi, T>', 'listenerFunction')
+            .removeBody()
+
+    attachableListenerManagerInterface
+            .addMethod('getListeners')
+            .setJavadocComment('''
+                Gets a map with all registered listeners that implement one or more
+                {@code GloballyAttachableListener}s and their assigned listener classes they listen to.
+
+                @param <T> The type of the listeners.
+                @return A map with all registered listeners that implement one or more
+                        {@code GloballyAttachableListener}s and their assigned listener
+                        classes they listen to.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('Map<T, List<Class<T>>>')
+            .removeBody()
+
+    attachableListenerManagerInterface
+            .addMethod('getListeners')
+            .setJavadocComment('''
+                Gets all globally attachable listeners of the given class.
+
+                @param listenerClass The class of the listener.
+                @param <T> The class of the listener.
+                @return A list with all listeners of the given type.
+            '''.stripIndent())
+            .addTypeParameter('T extends GloballyAttachableListener')
+            .setType('List<T>')
+            .addParameter('Class<T>', 'listenerClass')
+            .removeBody()
+}
+
+def addGenericObjectAttachableListenerMethods(typeSolver, attachableInterface, attachableListenerManagerFile,
+                                              attachableListenerManagerInterface, listenerManagerTypeParameter,
+                                              uncachedMessageAttachableListenerManagerInterface,
+                                              internalUncachedMessageAttachableListenerManagerFile,
+                                              internalUncachedMessageAttachableListenerManagerInterface,
+                                              objectClassByAttachableListenerManager,
+                                              internalAttachableListenerManagerFile,
+                                              internalAttachableListenerManagerInterface,
+                                              attachableInterfacesWithDirectSubtypes) {
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        addMessageSpecificGenericObjectAttachableListenerMethods typeSolver, attachableInterface,
+                attachableListenerManagerFile, attachableListenerManagerInterface, listenerManagerTypeParameter
+
+        [long, String].each { messageIdType ->
+            uncachedMessageAttachableListenerManagerInterface
+                    .addMethod('addMessageAttachableListener')
+                    .setJavadocComment('''
+                        Adds a listener that implements one or more {@code MessageAttachableListener}s
+                        to the message with the given id.
+                        Adding a listener multiple times will only add it once
+                        and return the same listener managers on each invocation.
+                        The order of invocation is according to first addition.
+
+                        @param messageId The id of the message which should be listened to.
+                        @param listener The listener to add.
+                        @param <T> The type of the listener.
+                        @return The managers for the added listener.
+                    '''.stripIndent())
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .setType('Collection<ListenerManager<T>>')
+                    .addParameter(messageIdType, 'messageId')
+                    .addParameter('T', 'listener')
+                    .removeBody()
+        }
+    }
+
+    attachableListenerManagerInterface
+            .addMethod("add$attachableInterface.name")
+            .setJavadocComment("""
+                Adds a listener that implements one or more {@code $attachableInterface.name}s.
+                Adding a listener multiple times will only add it once
+                and return the same listener managers on each invocation.
+                The order of invocation is according to first addition.
+
+                @param listener The listener to add.
+                @param <T> The type of the listener.
+                @return The managers for the added listener.
+            """.stripIndent())
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .setType("Collection<ListenerManager<$listenerManagerTypeParameter>>")
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    def objectClass = objectClassByAttachableListenerManager."${attachableInterface.name}Manager"
+    if (!objectClass) {
+        throw new ConfigurationException("Found no type extending / implementing ${attachableInterface.name}Manager")
+    }
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        internalUncachedMessageAttachableListenerManagerFile
+                .addImport(Collection)
+                .addImport(Map)
+                .addImport(Collectors)
+                .addImport(attachableInterface.qualifiedName)
+                .addImport(typeSolver.solveType('org.javacord.api.listener.ObjectAttachableListener').qualifiedName)
+                .addImport(typeSolver.solveType('org.javacord.core.util.ClassHelper').qualifiedName)
+    } else {
+        internalAttachableListenerManagerFile
+                .addImport(Collectors)
+                .addImport(typeSolver.solveType('org.javacord.core.util.ClassHelper').qualifiedName)
+    }
+
+    internalAttachableListenerManagerFile
+            .addImport(Collection)
+            .addImport(Map)
+            .addImport(attachableInterface.qualifiedName)
+            .addImport(objectClass.qualifiedName)
+            .addImport(typeSolver.solveType('org.javacord.api.listener.ObjectAttachableListener').qualifiedName)
+
+    def subtypes = [[attachableInterface]]
+    while (subtypes[0].any { attachableInterfacesWithDirectSubtypes[it] }) {
+        subtypes.add 0, subtypes[0].collectMany { attachableInterfacesWithDirectSubtypes[it] }
+    }
+    subtypes = subtypes.flatten().unique() - attachableInterface
+    subtypes.each {
+        internalAttachableListenerManagerFile.addImport it.qualifiedName
+    }
+
+    if (subtypes) {
+        internalAttachableListenerManagerFile.addImport Stream
+    }
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            def method = internalUncachedMessageAttachableListenerManagerInterface
+                    .addMethod('addMessageAttachableListener', Modifier.DEFAULT)
+                    .addMarkerAnnotation(Override)
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .setType('Collection<ListenerManager<T>>')
+                    .addParameter(messageIdType, 'messageId')
+                    .addParameter('T', 'listener')
+
+            switch (messageIdType) {
+                case long:
+                    method.addSingleMemberAnnotation(SuppressWarnings, '"unchecked"')
+                    method.createBody().addStatement '''
+                        return ClassHelper.getInterfacesAsStream(listener.getClass())
+                                .filter(MessageAttachableListener.class::isAssignableFrom)
+                                .filter(ObjectAttachableListener.class::isAssignableFrom)
+                                .map(listenerClass -> (Class<T>) listenerClass)
+                                .map(listenerClass -> ((DiscordApiImpl) getApi()).addObjectListener(
+                                        Message.class, messageId, listenerClass, listener))
+                                .collect(Collectors.toList());
+                    '''
+                    break
+
+                case String:
+                    method.createBody().addStatement """
+                        try {
+                            return addMessageAttachableListener(Long.valueOf(messageId), listener);
+                        } catch (NumberFormatException ignored) {
+                            return Collections.emptyList();
+                        }
+                    """
+                    break
+            }
+        }
+    }
+
+    def body = internalAttachableListenerManagerInterface
+            .addMethod("add$attachableInterface.name", Modifier.DEFAULT)
+            .addMarkerAnnotation(Override)
+            .addSingleMemberAnnotation(SuppressWarnings, '"unchecked"')
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .setType("Collection<ListenerManager<$listenerManagerTypeParameter>>")
+            .addParameter('T', 'listener')
+            .createBody()
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        body.addStatement(
+                'return MessageAttachableListenerManager.addMessageAttachableListener(getApi(), getId(), listener);')
+    } else {
+        body.addStatement """
+            return ClassHelper.getInterfacesAsStream(listener.getClass())
+                    .filter(${attachableInterface.name}.class::isAssignableFrom)
+                    .filter(ObjectAttachableListener.class::isAssignableFrom)
+                    .map(listenerClass -> (Class<T>) listenerClass)
+                    ${
+                        if (subtypes) {
+                            """.flatMap(listenerClass -> {
+                                ${
+                                    subtypes.collect {
+                                        """if (${it.name}.class.isAssignableFrom(listenerClass)) {
+                                            return add${it.name}((${it.name} & ObjectAttachableListener) listener)
+                                                    .stream();
+                                        } else """
+                                    }.join()
+                                }{
+                                    return Stream.of(((DiscordApiImpl) getApi()).addObjectListener(
+                                            ${objectClass.name}.class, getId(), listenerClass, listener));
+                                }
+                            })"""
+                        } else {
+                            ".map(listenerClass -> ((DiscordApiImpl) getApi()).addObjectListener(" +
+                                    "${objectClass.name}.class, getId(), listenerClass, listener))"
+                        }
+                    }
+                    .collect(Collectors.toList());
+        """
+    }
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            uncachedMessageAttachableListenerManagerInterface
+                    .addMethod('removeMessageAttachableListener')
+                    .setJavadocComment('''
+                        Removes a listener that implements one or more {@code MessageAttachableListener}s
+                        from the message with the given id.
+
+                        @param messageId The id of the message.
+                        @param listener The listener to remove.
+                        @param <T> The type of the listener.
+                    '''.stripIndent())
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .addParameter(messageIdType, 'messageId')
+                    .addParameter('T', 'listener')
+                    .removeBody()
+        }
+    }
+
+    attachableListenerManagerInterface
+            .addMethod("remove$attachableInterface.name")
+            .setJavadocComment("""
+                Removes a listener that implements one or more {@code $attachableInterface.name}s.
+
+                @param listener The listener to remove.
+                @param <T> The type of the listener.
+            """.stripIndent())
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            def method = internalUncachedMessageAttachableListenerManagerInterface
+                    .addMethod('removeMessageAttachableListener', Modifier.DEFAULT)
+                    .addMarkerAnnotation(Override)
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .addParameter(messageIdType, 'messageId')
+                    .addParameter('T', 'listener')
+
+            switch (messageIdType) {
+                case long:
+                    method.addSingleMemberAnnotation(SuppressWarnings, '"unchecked"')
+                    method.createBody().addStatement '''
+                        ClassHelper.getInterfacesAsStream(listener.getClass())
+                                .filter(MessageAttachableListener.class::isAssignableFrom)
+                                .filter(ObjectAttachableListener.class::isAssignableFrom)
+                                .map(listenerClass -> (Class<T>) listenerClass)
+                                .forEach(listenerClass -> removeListener(messageId, listenerClass, listener));
+                    '''
+                    break
+
+                case String:
+                    method.createBody().addStatement """
+                        try {
+                            removeMessageAttachableListener(Long.valueOf(messageId), listener);
+                        } catch (NumberFormatException ignored) { }
+                    """
+                    break
+            }
+        }
+    }
+
+    body = internalAttachableListenerManagerInterface
+            .addMethod("remove$attachableInterface.name", Modifier.DEFAULT)
+            .addMarkerAnnotation(Override)
+            .addSingleMemberAnnotation(SuppressWarnings, '"unchecked"')
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .addParameter('T', 'listener')
+            .createBody()
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        body.addStatement(
+                'MessageAttachableListenerManager.removeMessageAttachableListener(getApi(), getId(), listener);')
+    } else {
+        body.addStatement """
+            ClassHelper.getInterfacesAsStream(listener.getClass())
+                    .filter(${attachableInterface.name}.class::isAssignableFrom)
+                    .filter(ObjectAttachableListener.class::isAssignableFrom)
+                    .map(listenerClass -> (Class<T>) listenerClass)
+                    ${
+                        if (subtypes) {
+                            """.forEach(listenerClass -> {
+                                ${
+                                    subtypes.collect {
+                                        """if (${it.name}.class.isAssignableFrom(listenerClass)) {
+                                            remove${it.name}((${it.name} & ObjectAttachableListener) listener);
+                                        } else """
+                                    }.join()
+                                }{
+                                    ((DiscordApiImpl) getApi()).removeObjectListener(${objectClass.name}.class, getId(),
+                                                                                     listenerClass, listener);
+                                }
+                            })"""
+                        } else {
+                            ".forEach(listenerClass -> ((DiscordApiImpl) getApi()).removeObjectListener(" +
+                                    "${objectClass.name}.class, getId(), listenerClass, listener))"
+                        }
+                    };
+        """
+    }
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            uncachedMessageAttachableListenerManagerInterface
+                    .addMethod('getMessageAttachableListeners')
+                    .setJavadocComment('''
+                        Gets a map with all registered listeners that implement one or more
+                        {@code MessageAttachableListener}s and their assigned listener classes they listen to.
+
+                        @param messageId The id of the message.
+                        @param <T> The type of the listener.
+                        @return A map with all registered listeners that implement one or more
+                                {@code MessageAttachableListener}s and their assigned listener
+                                classes they listen to.
+                    '''.stripIndent())
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .setType('Map<T, List<Class<T>>>')
+                    .addParameter(messageIdType, 'messageId')
+                    .removeBody()
+        }
+    }
+
+    attachableListenerManagerInterface
+            .addMethod("get${attachableInterface.name}s")
+            .setJavadocComment("""
+                Gets a map with all registered listeners that implement one or more {@code $attachableInterface.name}s
+                and their assigned listener classes they listen to.
+
+                @param <T> The type of the listeners.
+                @return A map with all registered listeners that implement one or more
+                        {@code $attachableInterface.name}s and their assigned listener
+                        classes they listen to.
+            """.stripIndent())
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .setType('Map<T, List<Class<T>>>')
+            .removeBody()
+
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            body = internalUncachedMessageAttachableListenerManagerInterface
+                    .addMethod('getMessageAttachableListeners', Modifier.DEFAULT)
+                    .addMarkerAnnotation(Override)
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .setType('Map<T, List<Class<T>>>')
+                    .addParameter(messageIdType, 'messageId')
+                    .createBody()
+
+            switch (messageIdType) {
+                case long:
+                    body.addStatement 'return ((DiscordApiImpl) getApi()).getObjectListeners(Message.class, messageId);'
+                    break
+
+                case String:
+                    body.addStatement '''
+                        try {
+                            return getMessageAttachableListeners(Long.valueOf(messageId));
+                        } catch (NumberFormatException ignored) {
+                            return Collections.emptyMap();
+                        }
+                    '''
+                    break
+            }
+        }
+    }
+
+    def method = internalAttachableListenerManagerInterface
+            .addMethod("get${attachableInterface.name}s", Modifier.DEFAULT)
+            .addMarkerAnnotation(Override)
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .setType('Map<T, List<Class<T>>>')
+    body = method.createBody()
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        body.addStatement 'return MessageAttachableListenerManager.getMessageAttachableListeners(getApi(), getId());'
+    } else if (subtypes) {
+        method.addSingleMemberAnnotation(SuppressWarnings, '"unchecked"')
+        body.addStatement(
+                "Map<T, List<Class<T>>> listeners = ((DiscordApiImpl) getApi()).getObjectListeners(" +
+                        "${objectClass.name}.class, getId());")
+        subtypes.reverse().each {
+            body.addStatement """
+                get${it.name}s().forEach((listener, listenerClasses) -> listeners
+                        .merge((T) listener,
+                                (List<Class<T>>) (Object) listenerClasses,
+                                (listenerClasses1, listenerClasses2) -> {
+                                    listenerClasses1.addAll(listenerClasses2);
+                                    return listenerClasses1;
+                                }));
+            """
+        }
+        body.addStatement("return listeners;")
+    } else {
+        body.addStatement("return ((DiscordApiImpl) getApi()).getObjectListeners(${objectClass.name}.class, getId());")
+    }
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            uncachedMessageAttachableListenerManagerInterface
+                    .addMethod('removeListener')
+                    .setJavadocComment('''
+                        Removes a listener from this object.
+
+                        @param messageId The id of the message.
+                        @param listenerClass The listener class.
+                        @param listener The listener to remove.
+                        @param <T> The type of the listener.
+                    '''.stripIndent())
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .addParameter(messageIdType, 'messageId')
+                    .addParameter('Class<T>', 'listenerClass')
+                    .addParameter('T', 'listener')
+                    .removeBody()
+        }
+    }
+
+    attachableListenerManagerInterface
+            .addMethod('removeListener')
+            .setJavadocComment("""
+                Removes a listener from this object.
+
+                @param listenerClass The listener class.
+                @param listener The listener to remove.
+                @param <T> The type of the listener.
+            """.stripIndent())
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('T', 'listener')
+            .removeBody()
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        [long, String].each { messageIdType ->
+            body = internalUncachedMessageAttachableListenerManagerInterface
+                    .addMethod('removeListener', Modifier.DEFAULT)
+                    .addMarkerAnnotation(Override)
+                    .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                    .addParameter(messageIdType, 'messageId')
+                    .addParameter('Class<T>', 'listenerClass')
+                    .addParameter('T', 'listener')
+                    .createBody()
+
+            switch (messageIdType) {
+                case long:
+                    body.addStatement '((DiscordApiImpl) getApi()).removeObjectListener(' +
+                            'Message.class, messageId, listenerClass, listener);'
+                    break
+
+                case String:
+                    body.addStatement '''
+                        try {
+                            removeListener(Long.valueOf(messageId), listenerClass, listener);
+                        } catch (NumberFormatException ignored) { }
+                    '''
+                    break
+            }
+        }
+    }
+
+    body = internalAttachableListenerManagerInterface
+            .addMethod('removeListener', Modifier.DEFAULT)
+            .addMarkerAnnotation(Override)
+            .addTypeParameter("T extends $attachableInterface.name & ObjectAttachableListener")
+            .addParameter('Class<T>', 'listenerClass')
+            .addParameter('T', 'listener')
+            .createBody()
+
+    if (uncachedMessageAttachableListenerManagerInterface) {
+        body.addStatement 'MessageAttachableListenerManager.removeListener(getApi(), getId(), listenerClass, listener);'
+    } else {
+        body.addStatement "((DiscordApiImpl) getApi()).removeObjectListener(" +
+                "${objectClass.name}.class, getId(), listenerClass, listener);"
+    }
+}
+
+def addMessageSpecificGenericObjectAttachableListenerMethods(typeSolver, attachableInterface,
+                                                             attachableListenerManagerFile,
+                                                             attachableListenerManagerInterface,
+                                                             listenerManagerTypeParameter) {
+    def discordApi = typeSolver.solveType('org.javacord.api.DiscordApi')
+    if (discordApi.packageName != attachableInterface.packageName) {
+        attachableListenerManagerFile.addImport discordApi.qualifiedName
+    }
+
+    [long, String].each { messageIdType ->
+        attachableListenerManagerInterface
+                .addMethod('addMessageAttachableListener', Modifier.STATIC)
+                .setJavadocComment('''
+                    Adds a listener that implements one or more {@code MessageAttachableListener}s to the message with
+                    the given id.
+                    Adding a listener multiple times will only add it once
+                    and return the same listener managers on each invocation.
+                    The order of invocation is according to first addition.
+
+                    @param api The discord api instance.
+                    @param messageId The id of the message which should be listened to.
+                    @param listener The listener to add.
+                    @param <T> The type of the listener.
+                    @return The managers for the added listener.
+                '''.stripIndent())
+                .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                .setType("Collection<ListenerManager<$listenerManagerTypeParameter>>")
+                .addParameter('DiscordApi', 'api')
+                .addParameter(messageIdType, 'messageId')
+                .addParameter('T', 'listener')
+                .createBody()
+                .addStatement('return api.getUncachedMessageUtil().addMessageAttachableListener(messageId, listener);')
+    }
+
+    [long, String].each { messageIdType ->
+        attachableListenerManagerInterface
+                .addMethod('removeMessageAttachableListener', Modifier.STATIC)
+                .setJavadocComment('''
+                    Removes a listener that implements one or more {@code MessageAttachableListener}s from the message
+                    with the given id.
+
+                    @param api The discord api instance.
+                    @param messageId The id of the message.
+                    @param listener The listener to remove.
+                    @param <T> The type of the listener.
+                '''.stripIndent())
+                .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                .addParameter('DiscordApi', 'api')
+                .addParameter(messageIdType, 'messageId')
+                .addParameter('T', 'listener')
+                .createBody()
+                .addStatement('api.getUncachedMessageUtil().removeMessageAttachableListener(messageId, listener);')
+    }
+
+    [long, String].each { messageIdType ->
+        attachableListenerManagerInterface
+                .addMethod('getMessageAttachableListeners', Modifier.STATIC)
+                .setJavadocComment('''
+                    Gets a map with all registered listeners that implement one or more
+                    {@code MessageAttachableListener}s and their assigned listener classes they listen to for the
+                    message with the given id.
+
+                    @param api The discord api instance.
+                    @param messageId The id of the message.
+                    @param <T> The type of the listeners.
+                    @return A map with all registered listeners that implement one or more
+                            {@code MessageAttachableListener}s and their assigned listener
+                            classes they listen to.
+                '''.stripIndent())
+                .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                .setType('Map<T, List<Class<T>>>')
+                .addParameter('DiscordApi', 'api')
+                .addParameter(messageIdType, 'messageId')
+                .createBody()
+                .addStatement('return api.getUncachedMessageUtil().getMessageAttachableListeners(messageId);')
+    }
+
+    [long, String].each { messageIdType ->
+        attachableListenerManagerInterface
+                .addMethod('removeListener', Modifier.STATIC)
+                .setJavadocComment('''
+                    Removes a {@code MessageAttachableListener} from the message with the given id.
+
+                    @param api The discord api instance.
+                    @param messageId The id of the message.
+                    @param listenerClass The listener class.
+                    @param listener The listener to remove.
+                    @param <T> The type of the listener.
+                '''.stripIndent())
+                .addTypeParameter('T extends MessageAttachableListener & ObjectAttachableListener')
+                .addParameter('DiscordApi', 'api')
+                .addParameter(messageIdType, 'messageId')
+                .addParameter('Class<T>', 'listenerClass')
+                .addParameter('T', 'listener')
+                .createBody()
+                .addStatement('api.getUncachedMessageUtil().removeListener(messageId, listenerClass, listener);')
+    }
+}
